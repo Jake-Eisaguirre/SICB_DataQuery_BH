@@ -1,0 +1,167 @@
+---
+title: "query"
+format: html
+editor: visual
+---
+
+# Load Packages
+
+```{r}
+#| output: false
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+librarian::shelf(tidyverse, here, DBI, RPostgres, lubridate)
+
+```
+
+# connect to `RIBBiTR` database
+```{r}
+
+tryCatch({
+    drv <- dbDriver("Postgres")
+    print("Connecting to Database…")
+    connection <- dbConnect(drv, 
+                 dbname = Sys.getenv("aws_dbname"),
+                 host = Sys.getenv("aws_host"), 
+                 port = Sys.getenv("aws_port"),
+                 user = Sys.getenv("aws_user"), 
+                 password = Sys.getenv("aws_password"),
+                 timezone=NULL)
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+    })
+
+
+# set search path
+dbExecute(connection, "set search_path = 'survey_data';")
+```
+
+# Penn
+## Query
+```{r}
+
+p_q <- "select r.region, s.site, v.date, s2.detection_type, v2.species_ves, v2.count
+        from region r
+        join site s on r.region_id = s.region_id
+        join visit v on s.site_id = v.site_id
+        join survey s2 on v.visit_id = s2.visit_id
+        join ves v2 on s2.survey_id = v2.survey_id
+        where r.region = 'pennsylvania';"
+
+raw_penn <- dbGetQuery(connection, p_q)
+
+```
+
+## Clean Penn
+```{r}
+
+clean_penn <- raw_penn %>% 
+  group_by(site, date, species_ves) %>% 
+  reframe(count = sum(count)) %>% 
+  filter(site %in% c("tuttle_pond", "phelps_pond", "rv_pond", "vorisek_pond")) %>% 
+  mutate(month = month(date),
+         year = year(date)) %>% 
+  unite(year_month, c("year", "month"), sep = "-") %>% 
+  filter(year_month %in% c("2023-5", "2023-7", "2023-6")) %>% 
+  select(!c(year_month)) %>% 
+  mutate(region = "usa") %>% 
+  rename(species = species_ves)
+
+```
+
+# Panama
+## VES Query
+```{r}
+
+
+ves_q <- "select l.location, r.region, s.site, v.date, s2.detection_type, v2.species_ves, 
+          v2.count
+          from location l
+          join region r on l.location_id = r.location_id
+          join site s on r.region_id = s.region_id
+          join visit v on s.site_id = v.site_id
+          join survey s2 on v.visit_id = s2.visit_id
+          join ves v2 on s2.survey_id = v2.survey_id
+          where l.location = 'panama'
+          and v.date > '2021-12-31'
+          and v.date < '2023-01-01';"
+
+raw_ves <- dbGetQuery(connection, ves_q)
+
+
+```
+
+## Clean VES
+```{r}
+
+clean_ves_pan <- raw_ves %>% 
+  rename(species = species_ves) %>% 
+  mutate(count = replace_na(count, 1)) %>% # Assumption that NA is a count of 1 
+                                           # Need to check with Jamie
+  group_by(region, site, date, species) %>% 
+  summarise(count = sum(count))
+  
+```
+
+## Cap Query
+```{r}
+
+cap_q <- "select l.location, r.region, s.site, v.date, s2.detection_type, c.species_capture
+          from location l
+          join region r on l.location_id = r.location_id
+          join site s on r.region_id = s.region_id
+          join visit v on s.site_id = v.site_id
+          join survey s2 on v.visit_id = s2.visit_id
+          join capture c on s2.survey_id = c.survey_id
+          where l.location = 'panama'
+          and v.date > '2021-12-31'
+          and v.date < '2023-01-01';"
+
+raw_cap <- dbGetQuery(connection, cap_q)
+
+```
+
+## Clean Cap
+```{r}
+
+clean_cap_pan <- raw_cap %>% 
+  rename(species = species_capture) %>% 
+  group_by(region, site, date, species) %>% 
+  summarise(count = n())
+
+```
+
+## Combine
+
+```{r}
+
+All_Panama_Detection <- clean_cap_pan %>% 
+  rbind(clean_ves_pan) %>% 
+  group_by(region, site, date, species) %>% 
+  summarise(count = sum(count)) %>% 
+  ungroup() %>% 
+  mutate(year = year(date),
+         month = month(date)) %>% 
+  unite(year_month, c("year", "month"), sep = "-") %>% 
+  filter(year_month %in% c("2022-11", "2022-12"),
+         site %in% c("rio_blanco", "tigrero", "altos_de_piedra", "cerro_negro")) %>% 
+  select(!c(year_month)) %>% 
+  mutate(species = if_else(is.na(species), "unknown", species))
+
+```
+
+# Combine Penn and Panama
+```{r}
+
+all_detection <- All_Panama_Detection %>% 
+  rbind(clean_penn)
+
+write_csv(all_detection, here("data", "SICB_Detections_BH.csv"))
+
+```
+
